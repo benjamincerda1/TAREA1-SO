@@ -1,0 +1,6 @@
+1 : prender_carbon : 100 :
+2 : comprar_pan : 100 :
+3 : asar_longaniza : 100 : 1
+4 : armar_choripan : 100 : 2, 3
+5 : servir_mesa : 100 : 4
+6 : poner_musica : 100 :
