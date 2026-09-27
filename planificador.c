@@ -5,7 +5,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <unistd.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 
 #define MAX_TAREAS      20000
 #define MAX_SUCESORES     128
@@ -353,6 +355,139 @@ static void mostrar_plan(void)
     printf("\n");
 }
 
+/* ---------------- cola de tareas listas ---------------- */
+
+static int cola[MAX_TAREAS];
+static int inicio_cola = 0;
+static int fin_cola    = 0;
+
+static void encolar(int indice)
+{
+    cola[fin_cola] = indice;
+    fin_cola++;
+}
+
+static int hay_en_cola(void)
+{
+    return inicio_cola < fin_cola;
+}
+
+static int sacar_de_cola(void)
+{
+    int indice = cola[inicio_cola];
+    inicio_cola++;
+    return indice;
+}
+
+/* ---------------- ejecucion ---------------- */
+
+typedef struct {
+    pid_t pid;
+    int   indice;
+} Proceso;
+
+static Proceso en_ejecucion[MAX_TAREAS];
+
+/* crea el proceso hijo que simula una tarea */
+static void lanzar_tarea(int i)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        perror("fork");
+        exit(1);
+    }
+
+    if (pid == 0) {
+        /* proceso hijo: espera su duracion y termina */
+        struct timespec espera;
+        espera.tv_sec  = tareas[i].duracion / 1000;
+        espera.tv_nsec = (tareas[i].duracion % 1000) * 1000000L;
+        nanosleep(&espera, NULL);
+        _exit(0);
+    }
+
+    tareas[i].pid    = pid;
+    tareas[i].estado = CORRIENDO;
+
+    printf("[inicia ] %-22s (%d ms)\n", tareas[i].nombre, tareas[i].duracion);
+}
+
+static void ejecutar_plan(int limite)
+{
+    for (int i = 0; i < total_tareas; i++) {
+        if (tareas[i].faltantes == 0)
+            encolar(i);
+    }
+
+    int activos    = 0;
+    int procesadas = 0;
+
+    while (procesadas < total_tareas) {
+
+        /* se lanzan tareas mientras quede cupo */
+        while (activos < limite && hay_en_cola()) {
+            int i = sacar_de_cola();
+
+            lanzar_tarea(i);
+
+            en_ejecucion[activos].pid    = tareas[i].pid;
+            en_ejecucion[activos].indice = i;
+            activos++;
+        }
+
+        /* nada corriendo y nada que lanzar: el resto quedo bloqueado */
+        if (activos == 0) {
+            printf("\nquedaron %d tareas que no pudieron ejecutarse\n",
+                   total_tareas - procesadas);
+            break;
+        }
+
+        /* el padre se queda dormido aca hasta que termine algun hijo */
+        int estado;
+        pid_t pid_terminado = waitpid(-1, &estado, 0);
+
+        if (pid_terminado < 0) {
+            perror("waitpid");
+            break;
+        }
+
+        int pos = -1;
+        for (int j = 0; j < activos; j++) {
+            if (en_ejecucion[j].pid == pid_terminado) {
+                pos = j;
+                break;
+            }
+        }
+        if (pos == -1)
+            continue;
+
+        int i = en_ejecucion[pos].indice;
+
+        /* se saca de la lista moviendo el ultimo a su lugar */
+        en_ejecucion[pos] = en_ejecucion[activos - 1];
+        activos--;
+        procesadas++;
+
+        if (WIFEXITED(estado) && WEXITSTATUS(estado) == 0) {
+            tareas[i].estado = TERMINADA;
+            printf("[termina] %-22s\n", tareas[i].nombre);
+
+            /* avisar a los que dependian de esta tarea */
+            for (int j = 0; j < tareas[i].total_sucesores; j++) {
+                int sucesor = tareas[i].sucesores[j];
+
+                tareas[sucesor].faltantes--;
+                if (tareas[sucesor].faltantes == 0)
+                    encolar(sucesor);
+            }
+        } else {
+            tareas[i].estado = FALLIDA;
+            printf("[falla  ] %-22s\n", tareas[i].nombre);
+        }
+    }
+}
+
 /* ---------------- main ---------------- */
 
 int main(int argc, char *argv[])
@@ -382,6 +517,9 @@ int main(int argc, char *argv[])
 
     printf("plan: %s | limite de procesos: %d\n\n", argv[1], limite);
     mostrar_plan();
+
+    printf("\n--- ejecucion ---\n");
+    ejecutar_plan(limite);
 
     liberar_tabla();
     return 0;
