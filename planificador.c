@@ -5,6 +5,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <errno.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -62,6 +64,17 @@ static Entrada *tabla[TAMANO_TABLA];
 /* porcentaje de probabilidad de que una tarea falle, para poder probar
    el aislamiento de errores. Por defecto queda en 0. */
 static int probabilidad_fallo = 0;
+
+/* Se levanta cuando el usuario aprieta Ctrl+C. El manejador no hace nada
+   mas que marcarla: si tocara las tareas o imprimiera podria quedar a
+   medias con lo que esta haciendo el programa en ese momento. */
+static volatile sig_atomic_t llego_sigint = 0;
+
+static void manejar_sigint(int senal)
+{
+    (void)senal;
+    llego_sigint = 1;
+}
 
 static char vacio[] = "";
 
@@ -422,6 +435,11 @@ static int lanzar_tarea(int i)
 
     if (pid == 0) {
         /* ---- proceso hijo ---- */
+
+        /* el hijo no usa el manejador del padre: si llega Ctrl+C simplemente
+           termina, que es el comportamiento por defecto */
+        signal(SIGINT, SIG_DFL);
+
         close(canal_insumos[1]);
         close(canal_aviso[0]);
 
@@ -527,6 +545,33 @@ static int cancelar_rama(int fallida)
     return canceladas;
 }
 
+/* Corta todas las actividades: mata a las que estan corriendo, espera a
+   que mueran para no dejar procesos sueltos, y marca como canceladas las
+   que todavia no alcanzaron a partir. */
+static void abortar_todo(int activos)
+{
+    printf("\n[seremi ] llego la inspeccion, se abortan todas las actividades\n");
+
+    for (int j = 0; j < activos; j++)
+        kill(en_ejecucion[j].pid, SIGTERM);
+
+    for (int j = 0; j < activos; j++) {
+        while (waitpid(en_ejecucion[j].pid, NULL, 0) < 0 && errno == EINTR)
+            ;
+
+        close(en_ejecucion[j].fd_aviso);
+        tareas[en_ejecucion[j].indice].estado = CANCELADA;
+
+        printf("[cancela] %-22s estaba en ejecucion\n",
+               tareas[en_ejecucion[j].indice].nombre);
+    }
+
+    for (int i = 0; i < total_tareas; i++) {
+        if (tareas[i].estado == ESPERANDO)
+            tareas[i].estado = CANCELADA;
+    }
+}
+
 static void ejecutar_plan(int limite)
 {
     for (int i = 0; i < total_tareas; i++) {
@@ -538,6 +583,11 @@ static void ejecutar_plan(int limite)
     int procesadas = 0;
 
     while (procesadas < total_tareas) {
+
+        if (llego_sigint) {
+            abortar_todo(activos);
+            break;
+        }
 
         /* se lanzan tareas mientras quede cupo */
         while (activos < limite && hay_en_cola()) {
@@ -562,6 +612,11 @@ static void ejecutar_plan(int limite)
         pid_t pid_terminado = waitpid(-1, &estado, 0);
 
         if (pid_terminado < 0) {
+            /* la señal interrumpio la espera: se vuelve al inicio del
+               ciclo para revisar la bandera */
+            if (errno == EINTR)
+                continue;
+
             perror("waitpid");
             break;
         }
@@ -658,6 +713,21 @@ int main(int argc, char *argv[])
     }
 
     srand(time(NULL));
+
+    /* se registra el manejador de Ctrl+C. Se usa sigaction en vez de signal
+       porque asi waitpid se interrumpe cuando llega la señal, en lugar de
+       quedarse esperando a que termine el hijo que estaba corriendo. */
+    struct sigaction accion;
+
+    memset(&accion, 0, sizeof(accion));
+    accion.sa_handler = manejar_sigint;
+    sigemptyset(&accion.sa_mask);
+    accion.sa_flags = 0;
+
+    if (sigaction(SIGINT, &accion, NULL) < 0) {
+        perror("sigaction");
+        return 1;
+    }
 
     if (leer_archivo(argv[1]) != 0) {
         liberar_tabla();
