@@ -5,502 +5,384 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
-#include <errno.h>
-#include <limits.h>
 #include <sys/types.h>
 
-#define MAX_NODOS    20000
-#define MAX_ID        64
-#define MAX_NOMBRE   128
-#define MAX_LINEA   8192
-#define HASH_SIZE   32768
-#define TIEMPO_MIN    100
-#define TIEMPO_MAX   5000
+#define MAX_TAREAS      20000
+#define MAX_SUCESORES     128
+#define MAX_PREDECESORES  128
+#define LARGO_ID           64
+#define LARGO_NOMBRE      128
+#define LARGO_DEPS        512
+#define LARGO_LINEA      2048
+#define TAMANO_TABLA    32768
+
+#define DURACION_MINIMA   100
+#define DURACION_MAXIMA  5000
 
 typedef enum {
-    PENDIENTE,
-    LISTO,
-    EJECUTANDO,
-    OK,
-    FALLIDO,
-    ABORTADO
+    ESPERANDO,
+    CORRIENDO,
+    TERMINADA,
+    FALLIDA,
+    CANCELADA
 } Estado;
 
 typedef struct {
-    char   id[MAX_ID];
-    char   nombre[MAX_NOMBRE];
-    int    tiempo_ms;
+    char   id[LARGO_ID];
+    char   nombre[LARGO_NOMBRE];
+    int    duracion;
+
+    char   deps_texto[LARGO_DEPS];   /* dependencias tal como venian escritas */
+    int    faltantes;                /* cuantas dependencias aun no terminan */
+
+    int    predecesores[MAX_PREDECESORES]; /* de quienes depende esta tarea */
+    int    total_predecesores;
+
+    int    sucesores[MAX_SUCESORES];       /* quienes esperan por esta tarea */
+    int    total_sucesores;
+
     Estado estado;
     pid_t  pid;
-    int    in_degree;
-    int   *sucesores;
-    int    n_sucesores;
-    int    cap_sucesores;
-} Nodo;
+} Tarea;
 
-typedef struct EntradaHash {
-    char                 id[MAX_ID];
-    int                  indice;
-    struct EntradaHash  *sig;
-} EntradaHash;
+typedef struct Entrada {
+    char            id[LARGO_ID];
+    int             indice;
+    struct Entrada *siguiente;
+} Entrada;
 
-typedef struct {
-    Nodo         *nodos;
-    int           n_nodos;
-    EntradaHash  *tabla[HASH_SIZE];
-} Grafo;
+static Tarea    tareas[MAX_TAREAS];
+static int      total_tareas = 0;
+static Entrada *tabla[TAMANO_TABLA];
 
-/* ------------------------------------------------------------------ */
-/* Utilidades de texto                                                 */
-/* ------------------------------------------------------------------ */
+static char vacio[] = "";
 
-/* Elimina espacios, tabulaciones y retornos de carro (\r de Windows)
-   al inicio y al final. Modifica la cadena en el lugar. */
-static char *trim(char *s)
+/* ---------------- tabla hash: id -> posicion en el arreglo ---------------- */
+
+static unsigned long funcion_hash(const char *texto)
 {
-    if (s == NULL)
-        return NULL;
+    unsigned long suma = 5381;
 
-    while (*s != '\0' && isspace((unsigned char)*s))
-        s++;
-
-    if (*s == '\0')
-        return s;
-
-    char *fin = s + strlen(s) - 1;
-    while (fin > s && isspace((unsigned char)*fin)) {
-        *fin = '\0';
-        fin--;
+    while (*texto != '\0') {
+        suma = suma * 33 + (unsigned char)*texto;
+        texto++;
     }
-    return s;
+    return suma % TAMANO_TABLA;
 }
 
-/* Divide la linea en como maximo max_campos usando ':' como separador.
-   A diferencia de strtok, NO colapsa separadores consecutivos, por lo
-   que un campo vacio se preserva como cadena vacia. Devuelve cuantos
-   campos encontro. */
-static int dividir(char *linea, char *campos[], int max_campos)
+static int buscar_id(const char *id)
 {
-    int n = 0;
-    char *inicio = linea;
-
-    while (n < max_campos) {
-        char *sep = strchr(inicio, ':');
-        if (sep == NULL) {
-            campos[n++] = inicio;
-            break;
-        }
-        *sep = '\0';
-        campos[n++] = inicio;
-        inicio = sep + 1;
-    }
-    return n;
-}
-
-/* ------------------------------------------------------------------ */
-/* Tabla hash: id (cadena) -> indice en el arreglo de nodos            */
-/* ------------------------------------------------------------------ */
-
-static unsigned long djb2(const char *s)
-{
-    unsigned long h = 5381;
-    int c;
-    while ((c = (unsigned char)*s++) != 0)
-        h = ((h << 5) + h) + (unsigned long)c;
-    return h;
-}
-
-static int hash_buscar(const Grafo *g, const char *id)
-{
-    unsigned long pos = djb2(id) % HASH_SIZE;
-    EntradaHash *e = g->tabla[pos];
+    Entrada *e = tabla[funcion_hash(id)];
 
     while (e != NULL) {
         if (strcmp(e->id, id) == 0)
             return e->indice;
-        e = e->sig;
+        e = e->siguiente;
     }
     return -1;
 }
 
-/* Devuelve 0 si inserto, -1 si el id ya estaba registrado. */
-static int hash_insertar(Grafo *g, const char *id, int indice)
+static void guardar_id(const char *id, int indice)
 {
-    if (hash_buscar(g, id) != -1)
-        return -1;
+    unsigned long pos = funcion_hash(id);
 
-    unsigned long pos = djb2(id) % HASH_SIZE;
-    EntradaHash *e = malloc(sizeof(EntradaHash));
-    if (e == NULL) {
+    Entrada *nueva = malloc(sizeof(Entrada));
+    if (nueva == NULL) {
         perror("malloc");
-        exit(EXIT_FAILURE);
+        exit(1);
     }
 
-    snprintf(e->id, MAX_ID, "%s", id);
-    e->indice  = indice;
-    e->sig     = g->tabla[pos];
-    g->tabla[pos] = e;
-    return 0;
+    snprintf(nueva->id, LARGO_ID, "%s", id);
+    nueva->indice    = indice;
+    nueva->siguiente = tabla[pos];
+    tabla[pos] = nueva;
 }
 
-/* ------------------------------------------------------------------ */
-/* Construccion del grafo                                              */
-/* ------------------------------------------------------------------ */
-
-static void agregar_sucesor(Nodo *n, int indice_sucesor)
+static void liberar_tabla(void)
 {
-    if (n->n_sucesores == n->cap_sucesores) {
-        int nueva_cap = (n->cap_sucesores == 0) ? 4 : n->cap_sucesores * 2;
-        int *tmp = realloc(n->sucesores, (size_t)nueva_cap * sizeof(int));
-        if (tmp == NULL) {
-            perror("realloc");
-            exit(EXIT_FAILURE);
-        }
-        n->sucesores     = tmp;
-        n->cap_sucesores = nueva_cap;
-    }
-    n->sucesores[n->n_sucesores++] = indice_sucesor;
-}
+    for (int i = 0; i < TAMANO_TABLA; i++) {
+        Entrada *e = tabla[i];
 
-static void grafo_init(Grafo *g)
-{
-    g->nodos = calloc(MAX_NODOS, sizeof(Nodo));
-    if (g->nodos == NULL) {
-        perror("calloc");
-        exit(EXIT_FAILURE);
-    }
-    g->n_nodos = 0;
-    memset(g->tabla, 0, sizeof(g->tabla));
-}
-
-static void grafo_liberar(Grafo *g)
-{
-    for (int i = 0; i < g->n_nodos; i++)
-        free(g->nodos[i].sucesores);
-    free(g->nodos);
-
-    for (int i = 0; i < HASH_SIZE; i++) {
-        EntradaHash *e = g->tabla[i];
         while (e != NULL) {
-            EntradaHash *sig = e->sig;
+            Entrada *siguiente = e->siguiente;
             free(e);
-            e = sig;
+            e = siguiente;
         }
     }
 }
 
-/* Convierte el campo de tiempo. Si viene vacio asigna un valor
-   aleatorio en [TIEMPO_MIN, TIEMPO_MAX]. Devuelve -1 si es invalido. */
-static int parsear_tiempo(const char *campo)
+/* ---------------- manejo de texto ---------------- */
+
+/* saca los espacios del inicio y del final */
+static char *limpiar(char *texto)
 {
-    if (campo == NULL || *campo == '\0')
-        return TIEMPO_MIN + rand() % (TIEMPO_MAX - TIEMPO_MIN + 1);
+    while (*texto != '\0' && isspace((unsigned char)*texto))
+        texto++;
 
-    char *fin = NULL;
-    errno = 0;
-    long v = strtol(campo, &fin, 10);
+    if (*texto == '\0')
+        return texto;
 
-    if (errno != 0 || fin == campo || *fin != '\0' || v <= 0 || v > INT_MAX)
-        return -1;
+    char *final = texto + strlen(texto) - 1;
 
-    return (int)v;
+    while (final > texto && isspace((unsigned char)*final)) {
+        *final = '\0';
+        final--;
+    }
+    return texto;
 }
 
-/* Primera pasada: registra todos los IDs con su nombre y duracion. */
-static int primera_pasada(Grafo *g, FILE *f, const char *ruta)
+/* corta la linea en 4 partes usando los ':'. Si faltan partes las deja vacias */
+static void separar(char *linea, char *partes[4])
 {
-    char linea[MAX_LINEA];
-    int  n_linea = 0;
+    int n = 0;
+    char *actual = linea;
 
-    while (fgets(linea, sizeof(linea), f) != NULL) {
-        n_linea++;
+    while (n < 4) {
+        char *corte = strchr(actual, ':');
 
-        char copia[MAX_LINEA];
-        snprintf(copia, sizeof(copia), "%s", linea);
+        if (corte == NULL) {
+            partes[n] = actual;
+            n++;
+            break;
+        }
 
-        char *sin_espacios = trim(copia);
-        if (*sin_espacios == '\0' || *sin_espacios == '#')
+        *corte = '\0';
+        partes[n] = actual;
+        n++;
+        actual = corte + 1;
+    }
+
+    while (n < 4) {
+        partes[n] = vacio;
+        n++;
+    }
+}
+
+/* ---------------- carga del plan ---------------- */
+
+static int leer_archivo(const char *ruta)
+{
+    FILE *archivo = fopen(ruta, "r");
+    if (archivo == NULL) {
+        fprintf(stderr, "no se pudo abrir el archivo %s\n", ruta);
+        return -1;
+    }
+
+    char linea[LARGO_LINEA];
+    int numero_linea = 0;
+
+    while (fgets(linea, sizeof(linea), archivo) != NULL) {
+        numero_linea++;
+
+        char *sin_espacios = limpiar(linea);
+        if (*sin_espacios == '\0')
             continue;
 
-        char *campos[4] = { NULL, NULL, NULL, NULL };
-        int n_campos = dividir(sin_espacios, campos, 4);
+        char *partes[4];
+        separar(sin_espacios, partes);
 
-        if (n_campos < 2) {
-            fprintf(stderr, "%s:%d: formato invalido (se esperaba "
-                            "ID : Nombre : tiempo_ms : deps)\n", ruta, n_linea);
-            return -1;
-        }
-
-        char *id     = trim(campos[0]);
-        char *nombre = trim(campos[1]);
-        char *tiempo = (n_campos >= 3) ? trim(campos[2]) : (char *)"";
+        char *id       = limpiar(partes[0]);
+        char *nombre   = limpiar(partes[1]);
+        char *duracion = limpiar(partes[2]);
+        char *deps     = limpiar(partes[3]);
 
         if (*id == '\0') {
-            fprintf(stderr, "%s:%d: ID vacio\n", ruta, n_linea);
-            return -1;
-        }
-        if (strlen(id) >= MAX_ID) {
-            fprintf(stderr, "%s:%d: ID demasiado largo\n", ruta, n_linea);
-            return -1;
-        }
-        if (g->n_nodos >= MAX_NODOS) {
-            fprintf(stderr, "%s:%d: se supero el maximo de %d actividades\n",
-                    ruta, n_linea, MAX_NODOS);
+            fprintf(stderr, "linea %d: falta el id\n", numero_linea);
+            fclose(archivo);
             return -1;
         }
 
-        int ms = parsear_tiempo(tiempo);
-        if (ms < 0) {
-            fprintf(stderr, "%s:%d: tiempo invalido '%s'\n", ruta, n_linea, tiempo);
+        if (buscar_id(id) != -1) {
+            fprintf(stderr, "linea %d: el id %s esta repetido\n", numero_linea, id);
+            fclose(archivo);
             return -1;
         }
 
-        Nodo *n = &g->nodos[g->n_nodos];
-        snprintf(n->id,     MAX_ID,     "%s", id);
-        snprintf(n->nombre, MAX_NOMBRE, "%s", (*nombre != '\0') ? nombre : id);
-        n->tiempo_ms     = ms;
-        n->estado        = PENDIENTE;
-        n->pid           = -1;
-        n->in_degree     = 0;
-        n->sucesores     = NULL;
-        n->n_sucesores   = 0;
-        n->cap_sucesores = 0;
-
-        if (hash_insertar(g, id, g->n_nodos) != 0) {
-            fprintf(stderr, "%s:%d: ID duplicado '%s'\n", ruta, n_linea, id);
+        if (total_tareas >= MAX_TAREAS) {
+            fprintf(stderr, "el plan tiene mas de %d tareas\n", MAX_TAREAS);
+            fclose(archivo);
             return -1;
         }
-        g->n_nodos++;
+
+        Tarea *t = &tareas[total_tareas];
+
+        snprintf(t->id,         LARGO_ID,     "%s", id);
+        snprintf(t->nombre,     LARGO_NOMBRE, "%s", (*nombre != '\0') ? nombre : id);
+        snprintf(t->deps_texto, LARGO_DEPS,   "%s", deps);
+
+        /* si no viene la duracion se sortea entre 100 y 5000 ms */
+        if (*duracion == '\0')
+            t->duracion = DURACION_MINIMA + rand() % (DURACION_MAXIMA - DURACION_MINIMA + 1);
+        else
+            t->duracion = atoi(duracion);
+
+        if (t->duracion <= 0) {
+            fprintf(stderr, "linea %d: la duracion no es valida\n", numero_linea);
+            fclose(archivo);
+            return -1;
+        }
+
+        t->faltantes          = 0;
+        t->total_predecesores = 0;
+        t->total_sucesores    = 0;
+        t->estado          = ESPERANDO;
+        t->pid             = -1;
+
+        guardar_id(id, total_tareas);
+        total_tareas++;
     }
 
-    if (ferror(f)) {
-        perror("fgets");
+    fclose(archivo);
+
+    if (total_tareas == 0) {
+        fprintf(stderr, "el archivo no tiene tareas\n");
         return -1;
     }
     return 0;
 }
 
-/* Segunda pasada: resuelve dependencias y arma las listas de sucesores. */
-static int segunda_pasada(Grafo *g, FILE *f, const char *ruta)
+/* Las dependencias se resuelven recien cuando ya estan todas las tareas
+   cargadas, porque una tarea puede depender de otra que aparece mas abajo
+   en el archivo. */
+static int conectar_dependencias(void)
 {
-    char linea[MAX_LINEA];
-    int  n_linea = 0;
-    int  indice  = 0;
+    for (int i = 0; i < total_tareas; i++) {
 
-    while (fgets(linea, sizeof(linea), f) != NULL) {
-        n_linea++;
-
-        char copia[MAX_LINEA];
-        snprintf(copia, sizeof(copia), "%s", linea);
-
-        char *sin_espacios = trim(copia);
-        if (*sin_espacios == '\0' || *sin_espacios == '#')
+        if (tareas[i].deps_texto[0] == '\0')
             continue;
 
-        char *campos[4] = { NULL, NULL, NULL, NULL };
-        int n_campos = dividir(sin_espacios, campos, 4);
+        char copia[LARGO_DEPS];
+        snprintf(copia, sizeof(copia), "%s", tareas[i].deps_texto);
 
-        /* Sin cuarto campo: la actividad no tiene dependencias. */
-        if (n_campos < 4) {
-            indice++;
-            continue;
-        }
+        /* los corchetes se aceptan como separadores porque el enunciado
+           escribe la lista como [dep1, dep2] */
+        char *resto = NULL;
+        char *dep = strtok_r(copia, ",[] \t", &resto);
 
-        char *deps = trim(campos[3]);
-        if (*deps == '\0') {
-            indice++;
-            continue;
-        }
+        while (dep != NULL) {
+            char *id_dep = limpiar(dep);
 
-        char *guardar = NULL;
-        char *tok = strtok_r(deps, ",", &guardar);
+            if (*id_dep != '\0') {
+                int pos = buscar_id(id_dep);
 
-        while (tok != NULL) {
-            char *dep = trim(tok);
-
-            if (*dep != '\0') {
-                int idx_dep = hash_buscar(g, dep);
-
-                if (idx_dep == -1) {
-                    fprintf(stderr, "%s:%d: la actividad '%s' depende de '%s', "
-                                    "que no existe\n",
-                            ruta, n_linea, g->nodos[indice].id, dep);
-                    return -1;
-                }
-                if (idx_dep == indice) {
-                    fprintf(stderr, "%s:%d: la actividad '%s' depende de si misma\n",
-                            ruta, n_linea, g->nodos[indice].id);
+                if (pos == -1) {
+                    fprintf(stderr, "la tarea %s depende de %s, que no existe\n",
+                            tareas[i].id, id_dep);
                     return -1;
                 }
 
-                agregar_sucesor(&g->nodos[idx_dep], indice);
-                g->nodos[indice].in_degree++;
+                if (pos == i) {
+                    fprintf(stderr, "la tarea %s depende de si misma\n", tareas[i].id);
+                    return -1;
+                }
+
+                if (tareas[pos].total_sucesores >= MAX_SUCESORES) {
+                    fprintf(stderr, "la tarea %s tiene demasiados sucesores\n",
+                            tareas[pos].id);
+                    return -1;
+                }
+
+                if (tareas[i].total_predecesores >= MAX_PREDECESORES) {
+                    fprintf(stderr, "la tarea %s tiene demasiadas dependencias\n",
+                            tareas[i].id);
+                    return -1;
+                }
+
+                /* la relacion se guarda en los dos sentidos: hacia adelante
+                   para saber a quien avisar, y hacia atras para poder juntar
+                   despues los mensajes de las dependencias */
+                tareas[pos].sucesores[tareas[pos].total_sucesores] = i;
+                tareas[pos].total_sucesores++;
+
+                tareas[i].predecesores[tareas[i].total_predecesores] = pos;
+                tareas[i].total_predecesores++;
+
+                tareas[i].faltantes++;
             }
-            tok = strtok_r(NULL, ",", &guardar);
-        }
-        indice++;
-    }
 
-    if (ferror(f)) {
-        perror("fgets");
-        return -1;
-    }
-    return 0;
-}
-
-static int cargar_plan(Grafo *g, const char *ruta)
-{
-    FILE *f = fopen(ruta, "r");
-    if (f == NULL) {
-        fprintf(stderr, "no se pudo abrir '%s': %s\n", ruta, strerror(errno));
-        return -1;
-    }
-
-    if (primera_pasada(g, f, ruta) != 0) {
-        fclose(f);
-        return -1;
-    }
-
-    if (g->n_nodos == 0) {
-        fprintf(stderr, "'%s' no contiene actividades\n", ruta);
-        fclose(f);
-        return -1;
-    }
-
-    rewind(f);
-
-    if (segunda_pasada(g, f, ruta) != 0) {
-        fclose(f);
-        return -1;
-    }
-
-    fclose(f);
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Verificacion                                                        */
-/* ------------------------------------------------------------------ */
-
-/* Detecta ciclos y dependencias irresolubles contando cuantos nodos
-   alcanzaria un orden topologico (algoritmo de Kahn sobre copias). */
-static int detectar_ciclos(const Grafo *g)
-{
-    int *grado = malloc((size_t)g->n_nodos * sizeof(int));
-    int *cola  = malloc((size_t)g->n_nodos * sizeof(int));
-    if (grado == NULL || cola == NULL) {
-        perror("malloc");
-        exit(EXIT_FAILURE);
-    }
-
-    int fin = 0;
-    for (int i = 0; i < g->n_nodos; i++) {
-        grado[i] = g->nodos[i].in_degree;
-        if (grado[i] == 0)
-            cola[fin++] = i;
-    }
-
-    int inicio = 0;
-    int visitados = 0;
-
-    while (inicio < fin) {
-        int u = cola[inicio++];
-        visitados++;
-
-        for (int k = 0; k < g->nodos[u].n_sucesores; k++) {
-            int v = g->nodos[u].sucesores[k];
-            if (--grado[v] == 0)
-                cola[fin++] = v;
+            dep = strtok_r(NULL, ",[] \t", &resto);
         }
     }
-
-    free(grado);
-    free(cola);
-
-    if (visitados != g->n_nodos) {
-        fprintf(stderr, "el plan contiene un ciclo: %d de %d actividades "
-                        "nunca podrian ejecutarse\n",
-                g->n_nodos - visitados, g->n_nodos);
-        return -1;
-    }
     return 0;
 }
 
-static void imprimir_dag(const Grafo *g)
+/* ---------------- salida por pantalla ---------------- */
+
+static void mostrar_plan(void)
 {
-    printf("Actividades cargadas: %d\n\n", g->n_nodos);
-    printf("%-8s %-22s %8s %5s  %s\n", "ID", "NOMBRE", "TIEMPO", "DEPS", "SUCESORES");
+    printf("tareas cargadas: %d\n\n", total_tareas);
+    printf("%-8s %-22s %10s  %-14s %s\n",
+           "ID", "NOMBRE", "DURACION", "DEPENDE DE", "SUCESORES");
 
-    for (int i = 0; i < g->n_nodos; i++) {
-        const Nodo *n = &g->nodos[i];
+    for (int i = 0; i < total_tareas; i++) {
+        printf("%-8s %-22s %7d ms  ",
+               tareas[i].id, tareas[i].nombre, tareas[i].duracion);
 
-        printf("%-8s %-22s %6d ms %5d  ", n->id, n->nombre, n->tiempo_ms, n->in_degree);
+        char lista[LARGO_DEPS] = "";
+        for (int j = 0; j < tareas[i].total_predecesores; j++) {
+            if (j > 0)
+                strncat(lista, ", ", sizeof(lista) - strlen(lista) - 1);
+            strncat(lista, tareas[tareas[i].predecesores[j]].id,
+                    sizeof(lista) - strlen(lista) - 1);
+        }
+        printf("%-14s ", (lista[0] != '\0') ? lista : "-");
 
-        if (n->n_sucesores == 0) {
+        if (tareas[i].total_sucesores == 0) {
             printf("-");
         } else {
-            for (int k = 0; k < n->n_sucesores; k++)
-                printf("%s%s", (k > 0) ? ", " : "", g->nodos[n->sucesores[k]].id);
+            for (int j = 0; j < tareas[i].total_sucesores; j++) {
+                if (j > 0)
+                    printf(", ");
+                printf("%s", tareas[tareas[i].sucesores[j]].id);
+            }
         }
         printf("\n");
     }
 
-    printf("\nActividades iniciales (sin dependencias): ");
-    int primeras = 0;
-    for (int i = 0; i < g->n_nodos; i++) {
-        if (g->nodos[i].in_degree == 0)
-            printf("%s%s", (primeras++ > 0) ? ", " : "", g->nodos[i].id);
+    printf("\ntareas que pueden partir de inmediato: ");
+
+    int encontradas = 0;
+    for (int i = 0; i < total_tareas; i++) {
+        if (tareas[i].faltantes == 0) {
+            if (encontradas > 0)
+                printf(", ");
+            printf("%s", tareas[i].id);
+            encontradas++;
+        }
     }
     printf("\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
-
-static int parsear_k(const char *s)
-{
-    char *fin = NULL;
-    errno = 0;
-    long v = strtol(s, &fin, 10);
-
-    if (errno != 0 || fin == s || *fin != '\0' || v <= 0 || v > INT_MAX)
-        return -1;
-
-    return (int)v;
-}
+/* ---------------- main ---------------- */
 
 int main(int argc, char *argv[])
 {
     if (argc != 3) {
         fprintf(stderr, "uso: %s <plan.txt> <K>\n", argv[0]);
-        return EXIT_FAILURE;
+        return 1;
     }
 
-    int K = parsear_k(argv[2]);
-    if (K < 0) {
-        fprintf(stderr, "K debe ser un entero positivo, se recibio '%s'\n", argv[2]);
-        return EXIT_FAILURE;
+    int limite = atoi(argv[2]);
+    if (limite <= 0) {
+        fprintf(stderr, "K tiene que ser un numero mayor que 0\n");
+        return 1;
     }
 
-    srand((unsigned int)time(NULL));
+    srand(time(NULL));
 
-    Grafo g;
-    grafo_init(&g);
-
-    if (cargar_plan(&g, argv[1]) != 0) {
-        grafo_liberar(&g);
-        return EXIT_FAILURE;
+    if (leer_archivo(argv[1]) != 0) {
+        liberar_tabla();
+        return 1;
     }
 
-    if (detectar_ciclos(&g) != 0) {
-        grafo_liberar(&g);
-        return EXIT_FAILURE;
+    if (conectar_dependencias() != 0) {
+        liberar_tabla();
+        return 1;
     }
 
-    printf("Plan: %s | Concurrencia maxima (K): %d\n\n", argv[1], K);
-    imprimir_dag(&g);
+    printf("plan: %s | limite de procesos: %d\n\n", argv[1], limite);
+    mostrar_plan();
 
-    grafo_liberar(&g);
-    return EXIT_SUCCESS;
+    liberar_tabla();
+    return 0;
 }
