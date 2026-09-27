@@ -59,6 +59,10 @@ static Tarea    tareas[MAX_TAREAS];
 static int      total_tareas = 0;
 static Entrada *tabla[TAMANO_TABLA];
 
+/* porcentaje de probabilidad de que una tarea falle, para poder probar
+   el aislamiento de errores. Por defecto queda en 0. */
+static int probabilidad_fallo = 0;
+
 static char vacio[] = "";
 
 /* ---------------- tabla hash: id -> posicion en el arreglo ---------------- */
@@ -440,6 +444,15 @@ static int lanzar_tarea(int i)
         espera.tv_nsec = (tareas[i].duracion % 1000) * 1000000L;
         nanosleep(&espera, NULL);
 
+        /* cada hijo necesita su propia semilla, si no todos sortean lo
+           mismo porque heredan el estado del padre */
+        srand((unsigned int)getpid());
+
+        if (probabilidad_fallo > 0 && rand() % 100 < probabilidad_fallo) {
+            close(canal_aviso[1]);
+            _exit(1);
+        }
+
         /* deja su mensaje para las tareas que lo esperan */
         char mensaje[LARGO_MENSAJE];
         int largo = snprintf(mensaje, sizeof(mensaje), "%s listo (%d ms)",
@@ -477,6 +490,43 @@ static int lanzar_tarea(int i)
     return canal_aviso[0];
 }
 
+/* Marca como canceladas todas las tareas que dependian, directa o
+   indirectamente, de una tarea que fallo. Devuelve cuantas cancelo.
+   El recorrido es por niveles: se parte de la tarea fallida y se van
+   agregando sus sucesores a una lista por revisar. */
+static int cancelar_rama(int fallida)
+{
+    static int por_revisar[MAX_TAREAS];
+
+    int cantidad   = 0;
+    int revisadas  = 0;
+    int canceladas = 0;
+
+    por_revisar[cantidad] = fallida;
+    cantidad++;
+
+    while (revisadas < cantidad) {
+        int actual = por_revisar[revisadas];
+        revisadas++;
+
+        for (int j = 0; j < tareas[actual].total_sucesores; j++) {
+            int sucesor = tareas[actual].sucesores[j];
+
+            if (tareas[sucesor].estado == ESPERANDO) {
+                tareas[sucesor].estado = CANCELADA;
+                canceladas++;
+
+                printf("[cancela] %-22s depende de %s\n",
+                       tareas[sucesor].nombre, tareas[actual].nombre);
+
+                por_revisar[cantidad] = sucesor;
+                cantidad++;
+            }
+        }
+    }
+    return canceladas;
+}
+
 static void ejecutar_plan(int limite)
 {
     for (int i = 0; i < total_tareas; i++) {
@@ -507,7 +557,6 @@ static void ejecutar_plan(int limite)
                    total_tareas - procesadas);
             break;
         }
-
         /* el padre se queda dormido aca hasta que termine algun hijo */
         int estado;
         pid_t pid_terminado = waitpid(-1, &estado, 0);
@@ -558,17 +607,38 @@ static void ejecutar_plan(int limite)
             }
         } else {
             tareas[i].estado = FALLIDA;
-            printf("[falla  ] %-22s\n", tareas[i].nombre);
+
+            if (WIFSIGNALED(estado))
+                printf("[falla  ] %-22s (terminada por señal %d)\n",
+                       tareas[i].nombre, WTERMSIG(estado));
+            else
+                printf("[falla  ] %-22s (codigo %d)\n",
+                       tareas[i].nombre, WEXITSTATUS(estado));
+
+            /* el plan sigue: solo se cancela lo que dependia de esta tarea */
+            procesadas += cancelar_rama(i);
         }
     }
+
+    int listas = 0, fallidas = 0, canceladas = 0;
+
+    for (int i = 0; i < total_tareas; i++) {
+        if (tareas[i].estado == TERMINADA)      listas++;
+        else if (tareas[i].estado == FALLIDA)   fallidas++;
+        else if (tareas[i].estado == CANCELADA) canceladas++;
+    }
+
+    printf("\nresumen: %d completadas, %d fallidas, %d canceladas (de %d)\n",
+           listas, fallidas, canceladas, total_tareas);
 }
 
 /* ---------------- main ---------------- */
 
 int main(int argc, char *argv[])
 {
-    if (argc != 3) {
-        fprintf(stderr, "uso: %s <plan.txt> <K>\n", argv[0]);
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "uso: %s <plan.txt> <K> [probabilidad de falla 0-100]\n",
+                argv[0]);
         return 1;
     }
 
@@ -576,6 +646,15 @@ int main(int argc, char *argv[])
     if (limite <= 0) {
         fprintf(stderr, "K tiene que ser un numero mayor que 0\n");
         return 1;
+    }
+
+    if (argc == 4) {
+        probabilidad_fallo = atoi(argv[3]);
+
+        if (probabilidad_fallo < 0 || probabilidad_fallo > 100) {
+            fprintf(stderr, "la probabilidad de falla va entre 0 y 100\n");
+            return 1;
+        }
     }
 
     srand(time(NULL));
