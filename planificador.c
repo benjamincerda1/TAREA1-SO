@@ -15,6 +15,7 @@
 #define LARGO_ID           64
 #define LARGO_NOMBRE      128
 #define LARGO_DEPS        512
+#define LARGO_MENSAJE     128
 #define LARGO_LINEA      2048
 #define TAMANO_TABLA    32768
 
@@ -45,6 +46,7 @@ typedef struct {
 
     Estado estado;
     pid_t  pid;
+    char   mensaje[LARGO_MENSAJE];   /* aviso que deja al terminar */
 } Tarea;
 
 typedef struct Entrada {
@@ -229,6 +231,7 @@ static int leer_archivo(const char *ruta)
         t->total_sucesores    = 0;
         t->estado          = ESPERANDO;
         t->pid             = -1;
+        t->mensaje[0]      = '\0';
 
         guardar_id(id, total_tareas);
         total_tareas++;
@@ -384,13 +387,28 @@ static int sacar_de_cola(void)
 typedef struct {
     pid_t pid;
     int   indice;
+    int   fd_aviso;   /* por aca llega el mensaje que deja el hijo */
 } Proceso;
 
 static Proceso en_ejecucion[MAX_TAREAS];
 
-/* crea el proceso hijo que simula una tarea */
-static void lanzar_tarea(int i)
+/* Crea el proceso hijo que simula una tarea.
+   Se arman dos pipes: uno para mandarle al hijo los mensajes de las tareas
+   de las que depende, y otro para que el hijo devuelva su propio mensaje. */
+static int lanzar_tarea(int i)
 {
+    int canal_insumos[2];   /* padre -> hijo */
+    int canal_aviso[2];     /* hijo  -> padre */
+
+    if (pipe(canal_insumos) < 0 || pipe(canal_aviso) < 0) {
+        perror("pipe");
+        exit(1);
+    }
+
+    /* se vacia lo que quede pendiente de imprimir para que el hijo no
+       herede texto sin escribir */
+    fflush(stdout);
+
     pid_t pid = fork();
 
     if (pid < 0) {
@@ -399,18 +417,64 @@ static void lanzar_tarea(int i)
     }
 
     if (pid == 0) {
-        /* proceso hijo: espera su duracion y termina */
+        /* ---- proceso hijo ---- */
+        close(canal_insumos[1]);
+        close(canal_aviso[0]);
+
+        /* recibe los avisos de sus dependencias. Los lee hasta que el padre
+           cierra el pipe; quien los muestra por pantalla es el padre, para
+           que la salida salga en orden. */
+        char buffer[LARGO_MENSAJE * MAX_PREDECESORES];
+        int  total = 0;
+        int  leidos;
+
+        while ((leidos = read(canal_insumos[0], buffer + total,
+                              sizeof(buffer) - (size_t)total)) > 0) {
+            total += leidos;
+        }
+        close(canal_insumos[0]);
+
+        /* simula el trabajo */
         struct timespec espera;
         espera.tv_sec  = tareas[i].duracion / 1000;
         espera.tv_nsec = (tareas[i].duracion % 1000) * 1000000L;
         nanosleep(&espera, NULL);
+
+        /* deja su mensaje para las tareas que lo esperan */
+        char mensaje[LARGO_MENSAJE];
+        int largo = snprintf(mensaje, sizeof(mensaje), "%s listo (%d ms)",
+                             tareas[i].nombre, tareas[i].duracion);
+
+        write(canal_aviso[1], mensaje, (size_t)largo + 1);
+        close(canal_aviso[1]);
+
+        fflush(stdout);
         _exit(0);
     }
+
+    /* ---- proceso padre ---- */
+    close(canal_insumos[0]);
+    close(canal_aviso[1]);
 
     tareas[i].pid    = pid;
     tareas[i].estado = CORRIENDO;
 
     printf("[inicia ] %-22s (%d ms)\n", tareas[i].nombre, tareas[i].duracion);
+
+    /* le manda al hijo los mensajes que dejaron sus dependencias */
+    for (int j = 0; j < tareas[i].total_predecesores; j++) {
+        int anterior = tareas[i].predecesores[j];
+
+        if (tareas[anterior].mensaje[0] != '\0') {
+            write(canal_insumos[1], tareas[anterior].mensaje,
+                  strlen(tareas[anterior].mensaje) + 1);
+
+            printf("           recibe: %s\n", tareas[anterior].mensaje);
+        }
+    }
+    close(canal_insumos[1]);
+
+    return canal_aviso[0];
 }
 
 static void ejecutar_plan(int limite)
@@ -429,10 +493,11 @@ static void ejecutar_plan(int limite)
         while (activos < limite && hay_en_cola()) {
             int i = sacar_de_cola();
 
-            lanzar_tarea(i);
+            int fd = lanzar_tarea(i);
 
-            en_ejecucion[activos].pid    = tareas[i].pid;
-            en_ejecucion[activos].indice = i;
+            en_ejecucion[activos].pid      = tareas[i].pid;
+            en_ejecucion[activos].indice   = i;
+            en_ejecucion[activos].fd_aviso = fd;
             activos++;
         }
 
@@ -462,7 +527,17 @@ static void ejecutar_plan(int limite)
         if (pos == -1)
             continue;
 
-        int i = en_ejecucion[pos].indice;
+        int i  = en_ejecucion[pos].indice;
+        int fd = en_ejecucion[pos].fd_aviso;
+
+        /* el hijo ya termino, asi que su mensaje esta esperando en el pipe */
+        int leidos = read(fd, tareas[i].mensaje, LARGO_MENSAJE);
+        if (leidos > 0)
+            tareas[i].mensaje[leidos - 1] = '\0';
+        else
+            tareas[i].mensaje[0] = '\0';
+
+        close(fd);
 
         /* se saca de la lista moviendo el ultimo a su lugar */
         en_ejecucion[pos] = en_ejecucion[activos - 1];
@@ -471,7 +546,7 @@ static void ejecutar_plan(int limite)
 
         if (WIFEXITED(estado) && WEXITSTATUS(estado) == 0) {
             tareas[i].estado = TERMINADA;
-            printf("[termina] %-22s\n", tareas[i].nombre);
+            printf("[termina] %-22s -> %s\n", tareas[i].nombre, tareas[i].mensaje);
 
             /* avisar a los que dependian de esta tarea */
             for (int j = 0; j < tareas[i].total_sucesores; j++) {
