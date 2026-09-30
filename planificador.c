@@ -66,7 +66,7 @@ static Entrada *tabla[TAMANO_TABLA];
 static int probabilidad_fallo = 0;
 
 /* Se levanta cuando el usuario aprieta Ctrl+C. El manejador no hace nada
-   mas que marcarla: si tocara las tareas o imprimiera podria quedar a
+   mas que marcarla, si tocara las tareas o imprimiera podria quedar a
    medias con lo que esta haciendo el programa en ese momento. */
 static volatile sig_atomic_t llego_sigint = 0;
 
@@ -277,7 +277,7 @@ static int conectar_dependencias(void)
         snprintf(copia, sizeof(copia), "%s", tareas[i].deps_texto);
 
         /* los corchetes se aceptan como separadores porque el enunciado
-           escribe la lista como [dep1, dep2] */
+           escribe la lista como [dep1, dep2], para evitar errores se agrego esta condicion*/
         char *resto = NULL;
         char *dep = strtok_r(copia, ",[] \t", &resto);
 
@@ -310,7 +310,7 @@ static int conectar_dependencias(void)
                     return -1;
                 }
 
-                /* la relacion se guarda en los dos sentidos: hacia adelante
+                /* la relacion se guarda en los dos sentidos, hacia adelante
                    para saber a quien avisar, y hacia atras para poder juntar
                    despues los mensajes de las dependencias */
                 tareas[pos].sucesores[tareas[pos].total_sucesores] = i;
@@ -404,13 +404,13 @@ static int sacar_de_cola(void)
 typedef struct {
     pid_t pid;
     int   indice;
-    int   fd_aviso;   /* por aca llega el mensaje que deja el hijo */
+    int   fd_aviso;   
 } Proceso;
 
 static Proceso en_ejecucion[MAX_TAREAS];
 
 /* Crea el proceso hijo que simula una tarea.
-   Se arman dos pipes: uno para mandarle al hijo los mensajes de las tareas
+   Se arman dos pipes, uno para mandarle al hijo los mensajes de las tareas
    de las que depende, y otro para que el hijo devuelva su propio mensaje. */
 static int lanzar_tarea(int i)
 {
@@ -444,7 +444,7 @@ static int lanzar_tarea(int i)
         close(canal_aviso[0]);
 
         /* recibe los avisos de sus dependencias. Los lee hasta que el padre
-           cierra el pipe; quien los muestra por pantalla es el padre, para
+           cierra el pipe, quien los muestra por pantalla es el padre, para
            que la salida salga en orden. */
         char buffer[LARGO_MENSAJE * MAX_PREDECESORES];
         int  total = 0;
@@ -508,9 +508,9 @@ static int lanzar_tarea(int i)
     return canal_aviso[0];
 }
 
-/* Marca como canceladas todas las tareas que dependian, directa o
-   indirectamente, de una tarea que fallo. Devuelve cuantas cancelo.
-   El recorrido es por niveles: se parte de la tarea fallida y se van
+/* Marca como canceladas todas las tareas que dependientes, directa o
+   indirectamente, de una tarea que fallo, informa cuantas fueron canceladas
+   se realiza un recorrido por niveles, partiendo de la tarea fallida,
    agregando sus sucesores a una lista por revisar. */
 static int cancelar_rama(int fallida)
 {
@@ -545,9 +545,9 @@ static int cancelar_rama(int fallida)
     return canceladas;
 }
 
-/* Corta todas las actividades: mata a las que estan corriendo, espera a
+/* Corta todas las actividades, matando a las que estan corriendo, esperndo a
    que mueran para no dejar procesos sueltos, y marca como canceladas las
-   que todavia no alcanzaron a partir. */
+   que todavia no parten. */
 static void abortar_todo(int activos)
 {
     printf("\n[seremi ] llego la inspeccion, se abortan todas las actividades\n");
@@ -589,7 +589,7 @@ static void ejecutar_plan(int limite)
             break;
         }
 
-        /* se lanzan tareas mientras quede cupo */
+        /* se lanzan tareas mientras quede cupo/espacio */
         while (activos < limite && hay_en_cola()) {
             int i = sacar_de_cola();
 
@@ -646,6 +646,15 @@ static void ejecutar_plan(int limite)
         /* se saca de la lista moviendo el ultimo a su lugar */
         en_ejecucion[pos] = en_ejecucion[activos - 1];
         activos--;
+
+        /* si el Ctrl+C ya llego, este hijo murio por la señal y no por un
+           error propio, se aborta todo en vez de cancelar solo su rama */
+        if (llego_sigint) {
+            tareas[i].estado = CANCELADA;
+            abortar_todo(activos);
+            break;
+        }
+
         procesadas++;
 
         if (WIFEXITED(estado) && WEXITSTATUS(estado) == 0) {

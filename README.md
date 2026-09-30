@@ -2,7 +2,7 @@
 
 Tarea 1 — Sistemas Operativos, UDP.
 
-Integrantes: (nombre 1) y (nombre 2)
+Integrantes: Benjamin Cerda y Ailyn Machuca
 
 Esta es nuestra versión del simulador de actividades para las fondas del señor
 Loyola. Cada actividad se modela como un nodo dentro de un DAG y corre en su
@@ -130,6 +130,17 @@ realidad no corresponden.
 actividades, 128 dependencias y 128 sucesores por actividad). Si se supera,
 el programa simplemente lo informa y termina, en vez de fallar de forma
 silenciosa.
+
+**Planes imposibles.** Si en algún momento no queda ninguna actividad
+corriendo y tampoco hay ninguna lista para partir, pero todavía faltan
+actividades por procesar, significa que el plan tiene un ciclo. En ese caso
+preferimos que el programa informe cuántas quedaron sin ejecutarse y termine,
+en vez de quedarse esperando para siempre. Se puede probar así:
+
+```bash
+printf '1 : a : 100 : 2\n2 : b : 100 : 1\n' > ciclo.txt
+./planificador ciclo.txt 2
+```
 
 **Semilla propia en cada hijo.** Nos dimos cuenta de que, al heredar el
 estado del generador del padre, todos los hijos sortearían el mismo valor.
